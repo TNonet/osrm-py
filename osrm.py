@@ -10,7 +10,6 @@ try:
 except ImportError:
     import json
 
-
 from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
@@ -92,11 +91,46 @@ def _check_pairs(items):
             for p in items]))
 
 
+def _encode_array(value):
+    return ';'.join(map(lambda x: str(x) if x else "", value))
+
+
+def _decode_bool(value):
+    if value == 'true':
+        return True
+    elif value == 'false':
+        return False
+    else:
+        raise ValueError("expected 'true' or 'false, but got {v}".format(v=value))
+
+
+def _encode_bool(value):
+    return 'true' if value else 'false'
+
+
+def _encode_pairs(coordinates):
+    return ';'.join([','.join(map(str, coord)) for coord in coordinates])
+
+
+def _decode_response(url, status, response):
+    if status == 200:
+        return json.loads(response)
+    elif status == 400:
+        raise OSRMClientException(json.loads(response))
+    raise OSRMServerException(url, response)
+
+
 class BaseRequest:
 
-    def __init__(self, coordinates, radiuses=[], bearings=[], hints=[]):
-        assert _check_pairs(coordinates), \
-            '''coordinates must be in format [[longitude, latitude],...]'''
+    def __init__(self, coordinates, radiuses=None, bearings=None, hints=None):
+        if hints is None:
+            hints = []
+        if bearings is None:
+            bearings = []
+        if radiuses is None:
+            radiuses = []
+
+        assert _check_pairs(coordinates), '''coordinates must be in format [[longitude, latitude],...]'''
         assert all([
             -180 <= lon <= 180 and -90 <= lat <= 90
             for lon, lat in coordinates]), \
@@ -117,34 +151,17 @@ class BaseRequest:
         self.hints = hints
 
     def get_coordinates(self):
-        return self._encode_pairs(self.coordinates)
+        return _encode_pairs(self.coordinates)
 
     def get_options(self):
         return {
-            'radiuses': self._encode_array(self.radiuses),
-            'bearings': self._encode_pairs(self.bearings),
-            'hints': self._encode_array(self.hints)
+            'radiuses': _encode_array(self.radiuses),
+            'bearings': _encode_pairs(self.bearings),
+            'hints': _encode_array(self.hints)
         }
-
-    def _encode_array(self, value):
-        return ';'.join(map(lambda x: str(x) if x else "", value))
-
-    def _encode_bool(self, value):
-        return 'true' if value else 'false'
-
-    def _encode_pairs(self, coordinates):
-        return ';'.join([','.join(map(str, coord)) for coord in coordinates])
-
-    def decode_response(self, url, status, response):
-        if status == 200:
-            return json.loads(response)
-        elif status == 400:
-            raise OSRMClientException(json.loads(response))
-        raise OSRMServerException(url, response)
 
 
 class NearestRequest(BaseRequest):
-
     service = 'nearest'
 
     def __init__(self, number=1, **kwargs):
@@ -161,19 +178,13 @@ class RouteRequest(BaseRequest):
 
     service = 'route'
 
-    def __init__(
-            self,
-            alternatives=False,
-            steps=False, annotations=False,
-            geometries=geometries.geojson,
-            overview=overview.simplified,
-            continue_straight=continue_straight.default,
-            **kwargs):
+    def __init__(self, alternatives=False, steps=False, annotations=False, geometries=geometries.geojson,
+                 overview=overview.simplified, continue_straight=continue_straight.default, **kwargs):
         super().__init__(**kwargs)
 
         assert isinstance(alternatives, bool)
         assert isinstance(steps, bool)
-        assert isinstance(annotations, bool)
+        assert isinstance(annotations, (bool, str))
         assert isinstance(geometries, osrm_geometries)
         assert isinstance(overview, osrm_overview)
         assert isinstance(continue_straight, osrm_continue_straight)
@@ -188,11 +199,11 @@ class RouteRequest(BaseRequest):
     def get_options(self):
         options = super().get_options()
         options.update({
-            'alternatives': self._encode_bool(self.alternatives),
-            'steps':        self._encode_bool(self.steps),
-            'annotations':  self._encode_bool(self.annotations),
-            'geometries':   self.geometries.value,
-            'overview':     self.overview.value
+            'alternatives': _encode_bool(self.alternatives),
+            'steps': _encode_bool(self.steps),
+            'annotations': _encode_bool(self.annotations) if isinstance(self.annotations, bool) else self.annotations,
+            'geometries': self.geometries.value,
+            'overview': self.overview.value
         })
         if self.continue_straight != continue_straight.default:
             options['continue_straight'] = self.continue_straight.value
@@ -203,13 +214,10 @@ class MatchRequest(RouteRequest):
 
     service = 'match'
 
-    def __init__(
-            self,
-            timestamps=[],
-            gaps=gaps.split,
-            tidy=False,
-            **kwargs):
+    def __init__(self, timestamps=None, gaps=gaps.split, tidy=False, **kwargs):
         super().__init__(**kwargs)
+        if timestamps is None:
+            timestamps = []
         assert isinstance(timestamps, list)
         assert isinstance(gaps, osrm_gaps)
         assert isinstance(tidy, bool)
@@ -221,23 +229,49 @@ class MatchRequest(RouteRequest):
     def get_options(self):
         options = super().get_options()
         options.pop('alternatives', None)
-        options['timestamps'] = self._encode_array(self.timestamps)
+        options['timestamps'] = _encode_array(self.timestamps)
 
         # Don't send default values (for compatibility with 5.6)
         if self.gaps.value != osrm_gaps.split:
             options['gaps'] = self.gaps.value
         if self.tidy:
-            options['tidy'] = self._encode_bool(self.tidy)
+            options['tidy'] = _encode_bool(self.tidy)
         return options
+
+
+class MatchRequestSections(MatchRequest):
+
+    def __init__(self, max_match_size: int, match_overlap: float, **kwargs):
+        super().__init__(**kwargs)
+        assert isinstance(max_match_size, int)
+        assert isinstance(match_overlap, float)
+        assert 0 < max_match_size
+        assert 0 < match_overlap < 1
+        assert 0 < int(match_overlap*max_match_size) < max_match_size
+
+        self.max_match_size = max_match_size
+        self.match_overlap = match_overlap
+
+    def __iter__(self):
+        n = len(self.coordinates)
+        current = 0
+        overlap = int(self.max_match_size*self.match_overlap)
+        while current + overlap <= n:
+            temp_coords = self.coordinates[current:current+self.max_match_size]
+            temp_radiuses = self.radiuses[current:current+self.max_match_size] if self.radiuses else []
+            temp_timestamps = self.timestamps[current:current+self.max_match_size] if self.timestamps else []
+
+            yield MatchRequest(coordinates=temp_coords, timestamps=temp_timestamps, radiuses=temp_radiuses,
+                               steps=self.steps, annotations=self.annotations, overview=self.overview,
+                               geometries=self.geometries, gaps=self.gaps, continue_straight=self.continue_straight,
+                               tidy=self.tidy, alternatives=self.alternatives)
+
+            current += overlap
 
 
 class BaseClient:
 
-    def __init__(
-            self,
-            host='http://localhost:5000',
-            version='v1', profile='driving',
-            timeout=5, max_retries=5):
+    def __init__(self, host='http://localhost:5000', version='v1', profile='driving', timeout=5, max_retries=5):
         assert isinstance(host, str)
         assert isinstance(version, str)
         assert isinstance(profile, str)
@@ -291,16 +325,18 @@ class Client(BaseClient):
             MatchRequest(**kwargs)
         )
 
+    def match_sections(self, **kwargs):
+        return [self._request(match_request) for match_request in MatchRequestSections(**kwargs)]
+
     def _request(self, request):
         if not requests:
             raise RuntimeError('Module \'requests\' is not available')
         url, params = self._build_request(request)
         response = self.session.get(url, params=params, timeout=self.timeout)
-        return request.decode_response(url, response.status_code, response.text)
+        return _decode_response(url, response.status_code, response.text)
 
 
 class AioHTTPClient(BaseClient):
-
     BACKOFF_MAX = 120
     BACKOFF_FACTOR = 0.5
 
@@ -329,6 +365,9 @@ class AioHTTPClient(BaseClient):
             MatchRequest(**kwargs)
         )
 
+    async def match_sections(self, **kwargs):
+        return [await self._request(match_request) for match_request in MatchRequestSections(**kwargs)]
+
     def exp_backoff(self, attempt):
         timeout = min(self.timeout * (2 ** attempt), self.BACKOFF_MAX)
         return timeout + random.uniform(0, self.BACKOFF_FACTOR * timeout)
@@ -343,8 +382,7 @@ class AioHTTPClient(BaseClient):
                 async with self.session.get(
                         request_url, timeout=self.timeout) as response:
                     body = await response.text()
-                    return request.decode_response(
-                        response.url, response.status, body)
+                    return _decode_response(response.url, response.status, body)
             except asyncio.TimeoutError:
                 timeout = self.exp_backoff(attempt)
                 logger.info(

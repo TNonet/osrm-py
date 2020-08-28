@@ -10,7 +10,7 @@ import osrm
 
 logging.basicConfig(level=logging.DEBUG)
 
-OSRM_HOST = 'http://127.0.0.1:5000'
+OSRM_HOST = 'https://router.project-osrm.org'
 SAMPLE_ROUTE = [[-74.005482, 40.679220], [-74.005389, 40.679495],
                 [-74.005014, 40.679746], [-74.004927, 40.679718],
                 [-74.004694, 40.679651]]
@@ -41,7 +41,7 @@ class TestClient(unittest.TestCase):
             number=20
         )
         assert response['code'] == 'Ok'
-        assert len(response['waypoints']) == 12
+        assert len(response['waypoints']) == 14
 
         response = self.client.nearest(
             coordinates=[[-74.00578245683002, 40.60600816104437]],
@@ -50,7 +50,7 @@ class TestClient(unittest.TestCase):
             number=20
         )
         assert response['code'] == 'Ok'
-        assert len(response['waypoints']) == 3
+        assert len(response['waypoints']) == 4
 
         with self.assertRaises(AssertionError):
             self.client.nearest(
@@ -110,6 +110,19 @@ class TestClient(unittest.TestCase):
         assert response['code'] == 'Ok'
         assert len(response['matchings']) == 1
 
+    def test_match_sections(self):
+        responses = self.client.match_sections(
+            coordinates=SAMPLE_ROUTE,
+            radiuses=[9, 9, 10, 3, 3],
+            overview=osrm.overview.full,
+            max_match_size=3,
+            match_overlap=2/3
+        )
+
+        for sub_match in responses:
+            assert sub_match['code'] == 'Ok'
+
+
 
 def run_in_loop(f):
     @functools.wraps(f)
@@ -162,6 +175,19 @@ class TestAioHTTPClient(unittest.TestCase):
             gaps=osrm.gaps.split
         )
         assert response['code'] == 'Ok'
+
+    @run_in_loop
+    async def test_match_section(self):
+        responses = await self.client.match_sections(
+            coordinates=SAMPLE_ROUTE,
+            radiuses=[9, 9, 10, 3, 3],
+            overview=osrm.overview.full,
+            max_match_size=3,
+            match_overlap=2/3
+        )
+
+        for sub_match in responses:
+            assert sub_match['code'] == 'Ok'
 
     @run_in_loop
     async def test_route(self):
